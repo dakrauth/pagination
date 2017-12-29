@@ -28,6 +28,7 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+from django.utils.deprecation import MiddlewareMixin
 
 def get_page(self, suffix):
     """
@@ -40,7 +41,7 @@ def get_page(self, suffix):
         return 1
 
 
-class PaginationMiddleware(object):
+class PaginationMiddleware(MiddlewareMixin):
     """
     Inserts a variable representing the current page onto the request object if
     it exists in either **GET** or **POST** portions of the request.
