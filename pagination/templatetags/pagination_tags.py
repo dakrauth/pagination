@@ -28,11 +28,13 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-
+from django.http import Http404
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.core.paginator import Paginator, InvalidPage
-from django.http import Http404
+from django.template.base import TOKEN_BLOCK
+from django.template.loader import select_template
+from django.utils.text import unescape_string_literal
 from django.template import (
     Context,
     Library,
@@ -42,66 +44,30 @@ from django.template import (
     loader,
 )
 
-try:
-    from django.template.base import TOKEN_BLOCK
-except ImportError:     # Django < 1.8
-    from django.template import TOKEN_BLOCK
+DEFAULTS = {
+    'default_pagination': 20,
+    'default_window': 4,
+    'default_margin': 4,
+    'default_orphans': 0,
+    'invalid_page_raises_404': False,
+    'display_page_links': True,
+    'previous_link_decorator': "&lsaquo;&lsaquo; ",
+    'next_link_decorator': " &rsaquo;&rsaquo;",
+    'display_disabled_previous_link': False,
+    'display_disabled_next_link': False,
+    'disable_link_for_first_page': True,
+}
 
-from django.template.loader import select_template
-from django.utils.text import unescape_string_literal
+config = dict(DEFAULTS, **getattr(settings, 'PAGINATION', {}))
 
-# TODO, import this normally later on
-from ..settings import *
+register = Library()
 
 
-def do_autopaginate(parser, token):
-    """
-    Splits the arguments to the autopaginate tag and formats them correctly.
-
-    Syntax is:
-
-        autopaginate QUERYSET [PAGINATE_BY] [ORPHANS] [as NAME]
-    """
-    # Check whether there are any other autopaginations are later in this template
-    expr = lambda obj: (obj.token_type == TOKEN_BLOCK and \
-        len(obj.split_contents()) > 0 and obj.split_contents()[0] == "autopaginate")
-    multiple_paginations = len([tok for tok in parser.tokens if expr(tok)]) > 0
-
-    i = iter(token.split_contents())
-    paginate_by = None
-    queryset_var = None
-    context_var = None
-    orphans = None
-    word = None
+def get_page(request, suffix):
     try:
-        word = next(i)
-        assert word == "autopaginate"
-        queryset_var = next(i)
-        word = next(i)
-        if word != "as":
-            paginate_by = word
-            try:
-                paginate_by = int(paginate_by)
-            except ValueError:
-                pass
-            word = next(i)
-        if word != "as":
-            orphans = word
-            try:
-                orphans = int(orphans)
-            except ValueError:
-                pass
-            word = next(i)
-        assert word == "as"
-        context_var = next(i)
-    except StopIteration:
-        pass
-    if queryset_var is None:
-        raise TemplateSyntaxError(
-            "Invalid syntax. Proper usage of this tag is: "
-            "{% autopaginate QUERYSET [PAGINATE_BY] [ORPHANS]"
-            " [as CONTEXT_VAR_NAME] %}")
-    return AutoPaginateNode(queryset_var, multiple_paginations, paginate_by, orphans, context_var)
+        return int(request.GET['page%s' % suffix])
+    except (KeyError, ValueError, TypeError):
+        return 1
 
 
 class AutoPaginateNode(Node):
@@ -121,21 +87,20 @@ class AutoPaginateNode(Node):
         tag.  If you choose not to use *{% paginate %}*, make sure to display the
         list of available pages, or else the application may seem to be buggy.
     """
-    def __init__(self, queryset_var,  multiple_paginations, paginate_by=None,
-                 orphans=None, context_var=None):
-        if paginate_by is None:
-            paginate_by = DEFAULT_PAGINATION
-        if orphans is None:
-            orphans = DEFAULT_ORPHANS
+    def __init__(
+        self,
+        queryset_var,
+        multiple_paginations,
+        paginate_by=None,
+        orphans=None,
+        context_var=None
+    ):
+        paginate_by = paginate_by or config['default_pagination']
+        orphans = orphans or config['default_orphans']
+
         self.queryset_var = Variable(queryset_var)
-        if isinstance(paginate_by, int):
-            self.paginate_by = paginate_by
-        else:
-            self.paginate_by = Variable(paginate_by)
-        if isinstance(orphans, int):
-            self.orphans = orphans
-        else:
-            self.orphans = Variable(orphans)
+        self.paginate_by = paginate_by if isinstance(paginate_by, int) else Variable(paginate_by)
+        self.orphans = orphans if isinstance(orphans, int) else Variable(orphans)
         self.context_var = context_var
         self.multiple_paginations = multiple_paginations
 
@@ -151,34 +116,40 @@ class AutoPaginateNode(Node):
             paginate_by = self.paginate_by
         else:
             paginate_by = self.paginate_by.resolve(context)
+        
         if isinstance(self.orphans, int):
             orphans = self.orphans
         else:
             orphans = self.orphans.resolve(context)
+        
         paginator = Paginator(value, paginate_by, orphans)
         try:
             request = context['request']
         except KeyError:
             raise ImproperlyConfigured(
                 "You need to enable 'django.core.context_processors.request'."
-                " See linaro-django-pagination/README file for TEMPLATE_CONTEXT_PROCESSORS details")
+            )
         try:
-            page_obj = paginator.page(request.page(page_suffix))
+            page_obj = paginator.page(get_page(request, page_suffix))
         except InvalidPage:
-            if INVALID_PAGE_RAISES_404:
-                raise Http404('Invalid page requested.  If DEBUG were set to ' +
-                    'False, an HTTP 404 page would have been shown instead.')
+            if config['invalid_page_raises_404']:
+                raise Http404(
+                    'Invalid page requested. If DEBUG were False, an HTTP 404 '
+                    'page would have been shown instead.'
+                )
             context[key] = []
             context['invalid_page'] = True
-            return u''
+            return ''
+        
         if self.context_var is not None:
             context[self.context_var] = page_obj.object_list
         else:
             context[key] = page_obj.object_list
+        
         context['paginator'] = paginator
         context['page_obj'] = page_obj
         context['page_suffix'] = page_suffix
-        return u''
+        return ''
 
 
 class PaginateNode(Node):
@@ -195,32 +166,7 @@ class PaginateNode(Node):
         return loader.render_to_string(template_list, new_context)
 
 
-
-def do_paginate(parser, token):
-    """
-    Emits the pagination control for the most recent autopaginate list
-
-    Syntax is:
-
-        paginate [using "TEMPLATE"]
-
-    Where TEMPLATE is a quoted template name. If missing the default template
-    is used (paginate/pagination.html).
-    """
-    argv = token.split_contents()
-    argc = len(argv)
-    if argc == 1:
-        template = None
-    elif argc == 3 and argv[1] == 'using':
-        template = unescape_string_literal(argv[2])
-    else:
-        raise TemplateSyntaxError(
-            "Invalid syntax. Proper usage of this tag is: "
-            "{% paginate [using \"TEMPLATE\"] %}")
-    return PaginateNode(template)
-
-
-def paginate(context, window=DEFAULT_WINDOW, margin=DEFAULT_MARGIN):
+def paginate(context, window=None, margin=None):
     """
     Renders the ``pagination/pagination.html`` template, resulting in a
     Digg-like display of the available pages, given the current page.  If there
@@ -255,11 +201,15 @@ def paginate(context, window=DEFAULT_WINDOW, margin=DEFAULT_MARGIN):
         window=2, margin=0, current=5     ... 3 4 [5] 6 7 ...
         window=2, margin=0, current=11     ... 7 8 9 10 [11]
         """
-
+    window = window or config['default_window']
+    margin = margin or config['default_margin']
+    
     if window < 0:
         raise ValueError('Parameter "window" cannot be less than zero')
+    
     if margin < 0:
         raise ValueError('Parameter "margin" cannot be less than zero')
+    
     try:
         paginator = context['paginator']
         page_obj = context['page_obj']
@@ -308,28 +258,23 @@ def paginate(context, window=DEFAULT_WINDOW, margin=DEFAULT_MARGIN):
             if pages[-1] != paginator.num_pages:
                 pages.append(None)
 
-        new_context = {
+        new_context = dict(config, **{
             'MEDIA_URL': settings.MEDIA_URL,
             'STATIC_URL': getattr(settings, "STATIC_URL", None),
-            'disable_link_for_first_page': DISABLE_LINK_FOR_FIRST_PAGE,
-            'display_disabled_next_link': DISPLAY_DISABLED_NEXT_LINK,
-            'display_disabled_previous_link': DISPLAY_DISABLED_PREVIOUS_LINK,
-            'display_page_links': DISPLAY_PAGE_LINKS,
             'is_paginated': paginator.count > paginator.per_page,
-            'next_link_decorator': NEXT_LINK_DECORATOR,
             'page_obj': page_obj,
             'page_suffix': page_suffix,
             'pages': pages,
             'paginator': paginator,
-            'previous_link_decorator': PREVIOUS_LINK_DECORATOR,
             'records': records,
-        }
+        })
+
         if 'request' in context:
             getvars = context['request'].GET.copy()
             if 'page%s' % page_suffix in getvars:
                 del getvars['page%s' % page_suffix]
             if len(getvars.keys()) > 0:
-                new_context['getvars'] = "&%s" % getvars.urlencode()
+                new_context['getvars'] = "&{}".format(getvars.urlencode())
             else:
                 new_context['getvars'] = ''
         return new_context
@@ -337,6 +282,86 @@ def paginate(context, window=DEFAULT_WINDOW, margin=DEFAULT_MARGIN):
         return {}
 
 
-register = Library()
-register.tag('paginate', do_paginate)
-register.tag('autopaginate', do_autopaginate)
+@register.tag('autopaginate')
+def do_autopaginate(parser, token):
+    """
+    Splits the arguments to the autopaginate tag and formats them correctly.
+
+    Syntax is:
+
+        autopaginate QUERYSET [PAGINATE_BY] [ORPHANS] [as NAME]
+    """
+    # Check whether there are any other autopaginations are later in this template
+    def expression(obj):
+        return (
+            obj.token_type == TOKEN_BLOCK and
+            len(obj.split_contents()) > 0 and
+            obj.split_contents()[0] == "autopaginate"
+        )
+
+    multi_paginations = len([tok for tok in parser.tokens if expression(tok)]) > 0
+
+    i = iter(token.split_contents())
+    paginate_by = None
+    query_var = None
+    context_var = None
+    orphans = None
+    word = None
+    try:
+        word = next(i)
+        assert word == "autopaginate"
+        query_var = next(i)
+        word = next(i)
+        if word != "as":
+            paginate_by = word
+            try:
+                paginate_by = int(paginate_by)
+            except ValueError:
+                pass
+            word = next(i)
+        if word != "as":
+            orphans = word
+            try:
+                orphans = int(orphans)
+            except ValueError:
+                pass
+            word = next(i)
+        assert word == "as"
+        context_var = next(i)
+    except StopIteration:
+        pass
+    if query_var is None:
+        raise TemplateSyntaxError(
+            "Invalid syntax. Proper usage of this tag is: "
+            "{% autopaginate QUERYSET [PAGINATE_BY] [ORPHANS] "
+            "[as CONTEXT_VAR_NAME] %}"
+        )
+    
+    return AutoPaginateNode(query_var, multi_paginations, paginate_by, orphans, context_var)
+
+
+@register.tag('paginate')
+def do_paginate(parser, token):
+    """
+    Emits the pagination control for the most recent autopaginate list
+
+    Syntax is:
+
+        paginate [using "TEMPLATE"]
+
+    Where TEMPLATE is a quoted template name. If missing the default template
+    is used (paginate/pagination.html).
+    """
+    argv = token.split_contents()
+    argc = len(argv)
+    if argc == 1:
+        template = None
+    elif argc == 3 and argv[1] == 'using':
+        template = unescape_string_literal(argv[2])
+    else:
+        raise TemplateSyntaxError(
+            'Invalid syntax. Proper usage: {% paginate [using "TEMPLATE"] %}'
+        )
+
+    return PaginateNode(template)
+
